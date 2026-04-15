@@ -203,9 +203,9 @@ at::Tensor npu_chunk_fwd_o(
     int64_t V = k_sizes[3];
     int64_t HV = u_sizes[1];
     int64_t NT = 0;
-
-    if (cu_seqlens.has_value()) {
-        NT = cu_seqlens->size() - 1;
+    if (chunk_indices.has_value()) {
+        auto chunk_indices_ref = chunk_indices.value();
+        NT = chunk_indices_ref.size() / 2;
     } else {
         NT = (T + chunk_size_ - 1) / chunk_size_;
     }
