@@ -44,6 +44,7 @@ using _128 = tla::Int<128>;
 #include "tla/tensor.hpp"
 #endif
 
+#include "chunk_bwd_dv_local_struct.h"
 #include "chunk_bwd_dv_local_common.h"
 using namespace tla;
 namespace GDN {

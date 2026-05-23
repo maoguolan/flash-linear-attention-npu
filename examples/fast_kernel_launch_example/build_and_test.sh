@@ -11,6 +11,28 @@
 set -e
 cd "$(dirname "$0")"
 
+OP_NAME="${1:-}"
+
+usage() {
+    echo "Usage: $0 [OP_NAME]"
+    echo "  OP_NAME: operator name to test (e.g., add, grouped_matmul, chunk_bwd_dv_local)"
+    echo "  If not specified, all tests will be run."
+    exit 1
+}
+
+if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+    usage
+fi
+
+if [[ -n "$OP_NAME" && ! -d "tests/$OP_NAME" ]]; then
+    echo "Error: test directory 'tests/$OP_NAME' not found."
+    echo "Available operators:"
+    for dir in tests/*/; do
+        echo "  $(basename "$dir")"
+    done
+    exit 1
+fi
+
 # Install dependencies
 echo "Installing dependencies..."
 pip install -r requirements.txt
@@ -23,8 +45,12 @@ python3 -m pip install dist/*.whl --force-reinstall --no-deps
 
 # Run tests
 echo "Running tests..."
-for dir in tests/*/; do
-    test_dir=$(basename "$dir")
-    pytest "tests/$test_dir" -v
-done
+if [[ -n "$OP_NAME" ]]; then
+    pytest "tests/$OP_NAME" -v
+else
+    for dir in tests/*/; do
+        test_dir=$(basename "$dir")
+        pytest "tests/$test_dir" -v
+    done
+fi
 echo "execute samples success"

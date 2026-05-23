@@ -58,3 +58,9 @@ chunk_gated_delta_rule/chunk_bwd_dqkwg/tests/extra-info
 PROF_*
 OPPROF_*
 extra-info
+
+# examples
+examples/fast_kernel_launch_example/.cache
+examples/fast_kernel_launch_example/ascend_ops.egg-info
+examples/fast_kernel_launch_example/build/
+examples/fast_kernel_launch_example/dist

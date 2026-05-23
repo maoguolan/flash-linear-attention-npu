@@ -15,6 +15,7 @@
 #ifndef CHUNK_BWD_DV_LOCAL_VECTOR_H
 #define CHUNK_BWD_DV_LOCAL_VECTOR_H
 
+#include "chunk_bwd_dv_local_struct.h"
 #include "kernel_operator.h"
 
 namespace GDN {

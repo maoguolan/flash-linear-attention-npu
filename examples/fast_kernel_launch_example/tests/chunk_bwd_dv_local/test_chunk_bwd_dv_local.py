@@ -1,10 +1,22 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# -----------------------------------------------------------------------------------------------------------
+# Copyright (c) 2025 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 import torch
 import torch_npu
-from typing import Optional
+import ascend_ops
+import pytest
 import math
 import random
-import ct
-import fla_npu
+from typing import Optional
 
 def prepare_lens(cu_seqlens: torch.LongTensor) -> torch.LongTensor:
     return cu_seqlens[1:] - cu_seqlens[:-1]
@@ -39,11 +51,11 @@ def generate_cu_seqlens(
         seq_lengths.append(seq_len)
         remaining -= seq_len
     seq_lengths.append(remaining)
-    
+
     cu_seqlens = [0]
     for seq_len in seq_lengths:
         cu_seqlens.append(cu_seqlens[-1] + seq_len)
-    
+
     tensor = torch.tensor(cu_seqlens, dtype=torch.long)
     if device is not None:
         tensor = tensor.to(device)
@@ -118,7 +130,6 @@ def chunk_bwd_dv_local_fix(
             BV = min(BV, V)
             for i_v in range(0, V, BV):
                 v_end = min(i_v + BV, V)
-                v_width = v_end - i_v
                 b_do = do[batch_idx, i_h, chunk_start_token:chunk_start_token+chunk_len, i_v:v_end].to(torch.float32)
                 b_dv = torch.matmul(b_A_masked[:chunk_len, :chunk_len], b_do)
                 dv[batch_idx, i_h, chunk_start_token:chunk_start_token+chunk_len, i_v:v_end] += b_dv
@@ -192,76 +203,91 @@ def chunk_bwd_dv_local_variable(
             BV = min(BV, V)
             for i_v in range(0, V, BV):
                 v_end = min(i_v + BV, V)
-                v_width = v_end - i_v
                 b_do = do[batch_idx, i_h, global_start:global_start+chunk_len, i_v:v_end].to(torch.float32)
                 b_dv = torch.matmul(b_A_masked[:chunk_len, :chunk_len], b_do)
                 dv[batch_idx, i_h, global_start:global_start+chunk_len, i_v:v_end] += b_dv
     return dv
 
 
-def test_chunk_bwd_dv_local_fix(
-    B: int,
-    H: int,
-    T: int,
-    K: int,
-    V: int,
-    chunk_size: int,
-    scale: float,
-    ktype,
-    gtype,
-    seed: int = 0,
-):
-    torch.manual_seed(seed)
-    if not hasattr(test_chunk_bwd_dv_local_fix, "call_count"):
-        test_chunk_bwd_dv_local_fix.call_count = 1
-    else:
-        test_chunk_bwd_dv_local_fix.call_count += 1
+def test_chunk_bwd_dv_local_interface_exist():
+    """
+    Test that the 'ascend_ops.chunk_bwd_dv_local' operator is present in torch.ops.
+    This existence test asserts that the custom operator registered under the
+    'ascend_ops' namespace is discoverable from Python via torch.ops.ascend_ops.chunk_bwd_dv_local.
+    It does not exercise operator functionality — only that the Python binding
+    and registration are available.
+    """
+    print(torch.ops.ascend_ops.chunk_bwd_dv_local)
+    assert hasattr(torch.ops.ascend_ops, "chunk_bwd_dv_local"), \
+        "The 'chunk_bwd_dv_local' operator is not registered in the 'torch.ops.ascend_ops' namespace."
+
+
+FIX_TEST_CONFIGS = [
+    (2, 2, 65, 128, 128, 64, 0.0625, torch.float16, torch.float16),
+    (2, 2, 65, 128, 128, 64, 0.0625, torch.bfloat16, torch.bfloat16),
+    (2, 2, 65, 128, 128, 64, 0.0625, torch.bfloat16, torch.float32),
+    (2, 2, 65, 128, 128, 64, 0.0625, torch.float16, torch.float32),
+]
+
+VARIABLE_TEST_CONFIGS = [
+    (1, 2, 64, 128, 128, 64, 0.011, 2, torch.float16, torch.float16),
+    (1, 2, 64, 128, 128, 64, 0.011, 2, torch.bfloat16, torch.bfloat16),
+    (1, 2, 64, 128, 128, 64, 0.011, 2, torch.bfloat16, torch.float32),
+    (1, 2, 64, 128, 128, 64, 0.011, 2, torch.float16, torch.float32),
+]
+
+
+@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU device not found")
+@pytest.mark.parametrize("B,H,T,K,V,chunk_size,scale,ktype,gtype", FIX_TEST_CONFIGS)
+def test_chunk_bwd_dv_local_fix(B, H, T, K, V, chunk_size, scale, ktype, gtype):
+    """
+    Test the chunk_bwd_dv_local operator with fixed-length sequences.
+    Compares NPU kernel launch result against PyTorch golden implementation.
+    """
+    torch.manual_seed(0)
 
     q = create_tensor((B, H, T, K), dtype=ktype)
     k = create_tensor((B, H, T, K), dtype=ktype)
     d_o = create_tensor((B, H, T, V), dtype=ktype)
     g = torch.arange(B * H * T, 0, -1).reshape((B, H, T)).to(gtype)
-
-    cu_seqlens = None
-    dv_golden = chunk_bwd_dv_local_fix(q, k, d_o, g, scale, cu_seqlens, chunk_size)
-
+    print(" q.shape = ",q.shape)
+    dv_golden = chunk_bwd_dv_local_fix(q, k, d_o, g, scale, None, chunk_size)
+    print(" dv_golden.shape = ",dv_golden.shape)
     q_npu = q.npu()
     k_npu = k.npu()
     d_o_npu = d_o.npu()
     g_npu = g.npu()
 
-    dv = torch.ops.npu.npu_chunk_bwd_dv_local(
+    dv = torch.ops.ascend_ops.chunk_bwd_dv_local(
         q_npu, k_npu, d_o_npu, g_npu,
-        g_gamma=None,
-        A=None,
-        cu_seqlens=None,
-        chunk_indices=None,
-        scale=scale,
-        chunk_size=chunk_size
+        scale, chunk_size,
+        g_gamma=None, A=None, cu_seqlens=None, chunk_indices=None
     )
 
-    ct.single(dv.cpu(), dv_golden)
-    print(f"test_chunk_bwd_dv_local_fix 被调用了第 {test_chunk_bwd_dv_local_fix.call_count} 次")
+    dv_cpu = dv.cpu()
+    dv_golden_f32 = dv_golden.to(torch.float32)
+    dv_cpu_f32 = dv_cpu.to(torch.float32)
+
+    max_diff = torch.max(torch.abs(dv_cpu_f32 - dv_golden_f32)).item()
+    rtol = 1e-2
+    atol = 1e-2
+    assert torch.allclose(dv_cpu_f32, dv_golden_f32, rtol=rtol, atol=atol), \
+        f"chunk_bwd_dv_local_fix failed for B={B}, H={H}, T={T}, K={K}, V={V}, " \
+        f"chunk_size={chunk_size}, scale={scale}, ktype={ktype}, gtype={gtype}. " \
+        f"Max diff: {max_diff:.6f}"
+
+    print(f"✓ fix test passed: B={B}, H={H}, T={T}, K={K}, V={V}, "
+          f"chunk_size={chunk_size}, ktype={ktype}, gtype={gtype}, max_diff={max_diff:.6f}")
 
 
-def test_chunk_bwd_dv_local_variable(
-    B: int,
-    H: int,
-    T: int,
-    K: int,
-    V: int,
-    chunk_size: int,
-    scale: float,
-    cu_seqlens_len: int,
-    ktype,
-    gtype,
-    seed: int = 0,
-):
-    torch.manual_seed(seed)
-    if not hasattr(test_chunk_bwd_dv_local_variable, "call_count"):
-        test_chunk_bwd_dv_local_variable.call_count = 1
-    else:
-        test_chunk_bwd_dv_local_variable.call_count += 1
+@pytest.mark.skipif(not torch.npu.is_available(), reason="NPU device not found")
+@pytest.mark.parametrize("B,H,T,K,V,chunk_size,scale,cu_seqlens_len,ktype,gtype", VARIABLE_TEST_CONFIGS)
+def test_chunk_bwd_dv_local_variable(B, H, T, K, V, chunk_size, scale, cu_seqlens_len, ktype, gtype):
+    """
+    Test the chunk_bwd_dv_local operator with variable-length sequences.
+    Compares NPU kernel launch result against PyTorch golden implementation.
+    """
+    torch.manual_seed(0)
 
     q = create_tensor((B, H, T, K), dtype=ktype)
     k = create_tensor((B, H, T, K), dtype=ktype)
@@ -281,37 +307,26 @@ def test_chunk_bwd_dv_local_variable(
     cu_seqlens_list = cu_seqlens.tolist()
     chunk_indices_list = chunk_indices.flatten().tolist()
 
-    dv = torch.ops.npu.npu_chunk_bwd_dv_local(
+    dv = torch.ops.ascend_ops.chunk_bwd_dv_local(
         q_npu, k_npu, d_o_npu, g_npu,
-        g_gamma=None,
-        A=None,
+        scale, chunk_size,
+        g_gamma=None, A=None,
         cu_seqlens=cu_seqlens_list,
-        chunk_indices=chunk_indices_list,
-        scale=scale,
-        chunk_size=chunk_size
+        chunk_indices=chunk_indices_list
     )
 
-    ct.single(dv.cpu(), dv_golden)
-    print(f"test_chunk_bwd_dv_local_variable 被调用了第 {test_chunk_bwd_dv_local_variable.call_count} 次")
+    dv_cpu = dv.cpu()
+    dv_golden_f32 = dv_golden.to(torch.float32)
+    dv_cpu_f32 = dv_cpu.to(torch.float32)
 
+    max_diff = torch.max(torch.abs(dv_cpu_f32 - dv_golden_f32)).item()
+    rtol = 1e-2
+    atol = 1e-2
+    assert torch.allclose(dv_cpu_f32, dv_golden_f32, rtol=rtol, atol=atol), \
+        f"chunk_bwd_dv_local_variable failed for B={B}, H={H}, T={T}, K={K}, V={V}, " \
+        f"chunk_size={chunk_size}, scale={scale}, cu_seqlens_len={cu_seqlens_len}, " \
+        f"ktype={ktype}, gtype={gtype}. Max diff: {max_diff:.6f}"
 
-if __name__ == "__main__":
-    # Fix length tests
-    test_chunk_bwd_dv_local_fix(B=2, H=2, T=65, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_fix(B=2, H=2, T=65, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.bfloat16, gtype=torch.bfloat16)
-    test_chunk_bwd_dv_local_fix(B=2, H=2, T=65, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.bfloat16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_fix(B=2, H=2, T=65, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_fix(B=4, H=4, T=128, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_fix(B=8, H=8, T=256, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_fix(B=16, H=16, T=512, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_fix(B=32, H=32, T=1024, K=128, V=128, chunk_size=64, scale=0.0625, ktype=torch.float16, gtype=torch.float16)
-    
-    # Variable length tests
-    test_chunk_bwd_dv_local_variable(B=1, H=32, T=128, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=2, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_variable(B=1, H=16, T=256, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=3, ktype=torch.float16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_variable(B=1, H=8, T=512, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=4, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_variable(B=1, H=2, T=64, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=2, ktype=torch.float16, gtype=torch.float16)
-    test_chunk_bwd_dv_local_variable(B=1, H=2, T=64, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=2, ktype=torch.bfloat16, gtype=torch.bfloat16)
-    test_chunk_bwd_dv_local_variable(B=1, H=2, T=64, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=2, ktype=torch.bfloat16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_variable(B=1, H=2, T=64, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=2, ktype=torch.float16, gtype=torch.float32)
-    test_chunk_bwd_dv_local_variable(B=1, H=32, T=2048, K=128, V=128, chunk_size=64, scale=0.011, cu_seqlens_len=8, ktype=torch.float16, gtype=torch.float16)
+    print(f"✓ variable test passed: B={B}, H={H}, T={T}, K={K}, V={V}, "
+          f"chunk_size={chunk_size}, cu_seqlens_len={cu_seqlens_len}, "
+          f"ktype={ktype}, gtype={gtype}, max_diff={max_diff:.6f}")

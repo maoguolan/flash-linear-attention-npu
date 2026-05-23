@@ -34,7 +34,9 @@ set(INCLUDE_DIRECTORIES
     ${TORCH_NPU_INCLUDE_PATH}
     ${ASCEND_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../..
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/inc
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../chunk_gated_delta_rule/common
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/catlass/include
 )
 
 # link directories
